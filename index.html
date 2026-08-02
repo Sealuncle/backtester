@@ -453,7 +453,7 @@ function jsonp(url, timeout) {
     const cb = '__gs' + Math.random().toString(36).slice(2);
     const el = document.createElement('script');
     const done = () => { clearTimeout(tm); try { delete window[cb]; } catch (e) { window[cb] = undefined; } el.remove(); };
-    const tm = setTimeout(() => { done(); rej(new Error('응답 시간 초과')); }, timeout || 60000);
+    const tm = setTimeout(() => { done(); rej(new Error('응답 시간 초과')); }, timeout || 90000);
     window[cb] = d => { done(); res(d); };
     el.onerror = () => { done(); rej(new Error('웹앱을 불러오지 못했습니다')); };
     el.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'callback=' + cb;
@@ -498,6 +498,32 @@ function commit(id, pairs, srcLabel) {
   log(`${id}: ${merged.t.length}행 (${iso(merged.t[0])} ~ ${iso(merged.t[merged.t.length - 1])}) · ${srcLabel}`);
 }
 
+const sleep = m => new Promise(r => setTimeout(r, m));
+
+/** 구글시트 2단계 수집: 수식 기록 → 계산 대기 → 수확 */
+async function acquireFromSheet(id, ticker, years) {
+  const pre = await callGs({ mode: 'prepare', id, ticker: ticker || id, years });
+  if (pre.done && pre.series && pre.series[id] && !pre.series[id].error) {
+    commit(id, decodeCompact(pre.series[id]), '구글시트');
+    if (pre.resolved) { const r = regOf(id); if (r) { r.ticker = pre.resolved; saveReg(); } }
+    return;
+  }
+  log(`${id}: 시트에서 계산 중… (최대 40초)`);
+  let last = '';
+  for (let i = 0; i < 14; i++) {
+    await sleep(i < 3 ? 2500 : 3500);
+    const c = await callGs({ mode: 'collect', id });
+    last = c.diag || last;
+    if (c.done && c.series && c.series[id] && !c.series[id].error) {
+      commit(id, decodeCompact(c.series[id]), '구글시트');
+      if (c.resolved) { const r = regOf(id); if (r) { r.ticker = c.resolved; saveReg(); } }
+      return;
+    }
+    if (!c.pending) throw new Error((c.error || '수집 실패') + (last ? ' · ' + last : ''));
+  }
+  throw new Error('시간 초과' + (last ? ' · ' + last : ''));
+}
+
 /** 한 종목을 수집한다. 선호 경로 실패 시 다른 경로로 자동 전환 */
 async function acquire(id, ticker) {
   const years = Math.max(1, +$('#dsYears').value || 10);
@@ -506,16 +532,8 @@ async function acquire(id, ticker) {
   const errs = [];
   for (const src of order) {
     try {
-      if (src === 'gs') {
-        const d = await callGs({ mode: 'fetch', id, ticker: ticker || id, years });
-        const s = d.series && d.series[id];
-        if (!s) throw new Error('응답에 데이터가 없습니다');
-        if (s.error) throw new Error(s.error);
-        commit(id, decodeCompact(s), '구글시트');
-        if (d.resolved) { const r = regOf(id); if (r) { r.ticker = d.resolved; saveReg(); } }
-      } else {
-        commit(id, await fetchTwelve(id, years), 'Twelve Data');
-      }
+      if (src === 'gs') await acquireFromSheet(id, ticker, years);
+      else commit(id, await fetchTwelve(id, years), 'Twelve Data');
       return true;
     } catch (e) { errs.push(src === 'gs' ? '구글시트: ' + e.message : 'TwelveData: ' + e.message); }
   }
