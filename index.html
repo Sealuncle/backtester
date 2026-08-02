@@ -151,7 +151,7 @@ tbody tr:hover{background:#F2F3EE}
 </div>
 <header>
   <div class="hd">
-    <div class="brand">분할매매 백테스터</div>
+    <div class="brand">분할매매 백테스터 <span id="buildTag" style="font-weight:400;font-size:11px;color:var(--muted)"></span></div>
     <div class="spacer"></div>
     <button class="ghost" id="btnData">데이터 설정</button>
     <button class="ghost" id="btnReset">파라미터 초기화</button>
@@ -264,8 +264,10 @@ tbody tr:hover{background:#F2F3EE}
       </div>
       <div class="scroll" style="margin-top:12px"><table id="dsTbl"></table></div>
       <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <button class="ghost solid" id="btnFetchAll">보유 종목 전체 갱신</button>
+        <button class="ghost solid" id="btnPing">연결 점검</button>
+        <button class="ghost" id="btnFetchAll">보유 종목 전체 갱신</button>
         <button class="ghost" id="btnClearCache">받아온 데이터 삭제</button>
+        <button class="ghost" id="btnHardReload">최신 버전으로 새로고침</button>
       </div>
 
       <div class="sub" style="margin-top:18px;border-top:1px solid var(--line2);padding-top:14px">기기 간 설정 동기화</div>
@@ -276,6 +278,7 @@ tbody tr:hover{background:#F2F3EE}
         <label class="f chk" style="margin:0"><input type="checkbox" id="syncAuto">
           <label for="syncAuto" style="cursor:pointer">변경 시 자동 올리기</label></label>
       </div>
+      <div id="pingBox" class="note" style="margin-top:12px"></div>
       <div class="log" id="dsLog"></div>
 
       <div class="sub" style="margin-top:18px;border-top:1px solid var(--line2);padding-top:14px">기기 잠금</div>
@@ -321,6 +324,7 @@ const RAW={"SOXL":{"s":"2010-04-05","d":"1,1,1,1,3,1,1,1,1,3,1,1,1,1,3,1,1,1,1,3
 /* ══════════════════════════════════════════════════════════
    0. 저장소
    ══════════════════════════════════════════════════════════ */
+const APP_BUILD = '2026-08-02c';
 const _mem = {};
 const store = {
   get(k) { try { const v = localStorage.getItem(k); return v === null ? (k in _mem ? _mem[k] : null) : v; } catch (e) { return k in _mem ? _mem[k] : null; } },
@@ -1396,6 +1400,42 @@ async function tryUnlock() {
 $('#lockGo').addEventListener('click', tryUnlock);
 $('#lockPin').addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock(); });
 $('#lockSkip').addEventListener('click', () => { showLock(false); renderSec(); log('PIN 없이 열었습니다. 데이터 갱신은 되지 않습니다'); });
+
+/* ══════════════════════════════════════════════════════════
+   11. 연결 점검 · 버전
+   ══════════════════════════════════════════════════════════ */
+function pingLine(ok, label) {
+  return `<div><span class="dot ${ok === true ? 'ok' : ok === false ? 'no' : 'mid'}"></span>${label}</div>`;
+}
+async function runPing() {
+  const box = $('#pingBox');
+  box.innerHTML = '점검 중…';
+  const out = [pingLine(null, `앱 빌드 <b>${APP_BUILD}</b>`)];
+  try {
+    const d = await callGs({ mode: 'ping' });
+    const same = d.build === APP_BUILD;
+    out.push(pingLine(true, '웹앱 연결 정상'));
+    out.push(pingLine(same, `시트 스크립트 빌드 <b>${d.build || '표식 없음(구버전)'}</b>`
+      + (same ? '' : ' — 코드를 교체하고 <b>배포 → 배포 관리 → 새 버전</b>으로 재배포하세요')));
+    out.push(pingLine(d.externalFetch, d.externalFetch
+      ? '외부 요청 권한 정상 (CSV 수집 가능)'
+      : '외부 요청 권한 없음 — 편집기에서 <b>authorize</b> 실행 후 재배포'));
+    out.push(pingLine(true, `접근 토큰 검사 ${d.tokenRequired ? '켜짐' : '꺼짐'}`));
+    out.push(pingLine(d.watch > 0, `시트 보관 종목 ${d.watch}개`));
+    out.push(pingLine(d.cfgSaved, d.cfgSaved ? '시트에 저장된 설정 있음' : '시트에 저장된 설정 없음 — PC에서 먼저 올리세요'));
+  } catch (e) {
+    out.push(pingLine(false, '웹앱 연결 실패 — ' + e.message));
+    out.push(pingLine(null, 'URL·토큰을 확인하고, 스크립트가 <b>새 버전</b>으로 배포되었는지 보세요'));
+  }
+  box.innerHTML = out.join('');
+}
+$('#btnPing').addEventListener('click', runPing);
+$('#btnHardReload').addEventListener('click', () => {
+  const u = new URL(location.href);
+  u.searchParams.set('v', Date.now().toString(36));
+  location.replace(u.toString());
+});
+$('#buildTag').textContent = APP_BUILD;
 
 render();
 renderSec();
