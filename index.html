@@ -189,6 +189,38 @@ tbody tr:hover{background:#F2F3EE}
     </section>
 
     <section class="panel">
+      <h2>조합 백테스트 <span class="tag">두 종목 vs 단독 · 동일 총자금</span></h2>
+      <div class="pb">
+        <div class="grid">
+          <div class="f"><label for="pfB">상대 종목</label><select id="pfB"></select></div>
+          <div class="f"><label for="pfWa">현재 종목 비중 (%)</label>
+            <input type="number" id="pfWa" value="50" min="10" max="90" step="10"></div>
+          <div class="f"><label for="pfShared">배분 방식</label>
+            <select id="pfShared">
+              <option value="0">독립 배분만</option>
+              <option value="1" selected>독립 + 공유 예수금</option>
+            </select></div>
+          <div class="f"><label for="pfRoll">우선순위 롤링 기간 (거래일)</label>
+            <select id="pfRoll"><option>126</option><option selected>252</option><option>504</option></select></div>
+          <div class="f"><label for="pfMax">종목별 최대 덩이 비율</label>
+            <select id="pfMax"><option value="0.5">50%</option><option value="0.65" selected>65%</option><option value="0.8">80%</option><option value="1">제한 없음</option></select></div>
+          <div class="f"><label for="pfLook">우선순위 계산 방식</label>
+            <select id="pfLook">
+              <option value="0" selected>롤링 (실전 재현 가능)</option>
+              <option value="1">전기간 고정 (미래참조 · 참고용)</option>
+            </select></div>
+        </div>
+        <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="ghost solid" id="btnPf">조합 실행</button>
+          <button class="ghost" id="btnPfSweep">비중 스윕 (10~90%)</button>
+        </div>
+        <div class="scroll" style="margin-top:12px"><table id="pfTbl"></table></div>
+        <div id="pfChart" style="margin-top:8px"></div>
+        <div class="cap" id="pfCap" style="border-top:0;padding-left:0"></div>
+      </div>
+    </section>
+
+    <section class="panel">
       <h2>파라미터 자동 탐색
         <span class="tag">과최적화에 주의하세요</span>
         <span class="right">
@@ -794,6 +826,7 @@ function simulate(sym, P, light) {
   return {
     ts, px, eq, ddA, bh, modeArr, ratioArr, capArr, capAdj, vx, years, trades, stillOpen,
     N, start, sym, P, baseId,
+    _sig: { qty, cost, sellIdx, proceeds, pnl, capArr, ratioArr, modeArr },
     summary: Object.assign(summaryCore, {
       pnl: closedSum, feeSaved, bhFinal: bh[N - 1], bhMdd: bmdd,
       bhCagr: Math.pow(bh[N - 1] / P.capital, 365 / Math.max(days, 1)) - 1,
@@ -993,6 +1026,256 @@ function syncSoon() {
   if (!$('#syncAuto').checked) return;
   clearTimeout(syncTimer);
   syncTimer = setTimeout(() => { cfgPush(true).catch(e => log('자동 올리기 실패 — ' + e.message)); }, 2500);
+}
+
+
+/* ══════════════════════════════════════════════════════════
+   7-3. 조합 백테스트
+   ══════════════════════════════════════════════════════════
+   독립 배분: 각 종목이 기존 엔진을 그대로 독립 실행, 자산곡선 합산.
+   공유 예수금: 하나의 현금 풀에서 매수 신호가 난 종목이 덩이를 꺼냄.
+     우선순위 = 직전 롤링 구간의 독립 시행 수익/MDD 가 높은 종목.
+     (전 기간 고정값을 쓰면 미래참조가 되므로 시점별 롤링으로 계산)
+*/
+
+/** 자산곡선에서 롤링 수익/MDD (연환산 수익률 / 구간 MDD) */
+function rollingCalmar(eq, win) {
+  const N = eq.length, out = new Array(N).fill(null);
+  for (let i = win; i < N; i++) {
+    const a = eq[i - win], b = eq[i];
+    if (!(a > 0)) continue;
+    const cagr = Math.pow(b / a, 252 / win) - 1;
+    let pk = 0, mdd = 0;
+    for (let k = i - win; k <= i; k++) { if (eq[k] > pk) pk = eq[k]; const d = eq[k] / pk - 1; if (d < mdd) mdd = d; }
+    out[i] = mdd < -0.0001 ? -cagr / mdd : cagr > 0 ? 99 : 0;
+  }
+  return out;
+}
+
+function ddOf(eq, start) {
+  let pk = 0; const o = new Array(eq.length).fill(0);
+  for (let i = start; i < eq.length; i++) { if (eq[i] > pk) pk = eq[i]; o[i] = eq[i] / pk - 1; }
+  return o;
+}
+function corrOf(x, y) {
+  const n = Math.min(x.length, y.length);
+  let s1 = 0, s2 = 0, s11 = 0, s22 = 0, s12 = 0, c = 0;
+  for (let i = 0; i < n; i++) {
+    if (x[i] === null || y[i] === null) continue;
+    s1 += x[i]; s2 += y[i]; s11 += x[i] * x[i]; s22 += y[i] * y[i]; s12 += x[i] * y[i]; c++;
+  }
+  const d = Math.sqrt((c * s11 - s1 * s1) * (c * s22 - s2 * s2));
+  return d ? (c * s12 - s1 * s2) / d : 0;
+}
+
+/**
+ * 조합 시뮬레이션.
+ * cfg = { a, b: 종목 id, wa: A 비중(0~1), capital, years,
+ *         shared: 0|1, rollWin, maxShare(종목별 최대 덩이 비율 0~1), lookahead: 0|1 }
+ * 종목별 매매 파라미터는 PARAMS의 각 종목 설정을 그대로 사용한다.
+ */
+function simulatePortfolio(cfg) {
+  const { a, b } = cfg;
+  if (!hasData(a) || !hasData(b) || a === b) return null;
+  const wa = Math.min(0.9, Math.max(0.1, cfg.wa)), wb = 1 - wa;
+
+  // 공통 구간: 두 종목 교집합에 백테스트 연수 적용
+  const s0 = Math.max(DB[a].t[0], DB[b].t[0]);
+
+  const mk = (id, cap) => {
+    const p = Object.assign({}, PARAMS[id] || defaultParams(id));
+    p.capital = cap; p.years = cfg.years;
+    return p;
+  };
+  const clipYears = (id) => {
+    // years 적용 후 시작이 교집합보다 이르면 교집합에 맞춰 잘라야 공정 비교가 된다
+    return mk(id, 1); // capital은 아래서 다시 설정
+  };
+
+  // 단독(전액) — 비교 기준
+  const soloA = simulate(a, mk(a, cfg.capital));
+  const soloB = simulate(b, mk(b, cfg.capital));
+  // 독립 배분용 절반 실행
+  const runA = simulate(a, mk(a, cfg.capital * wa));
+  const runB = simulate(b, mk(b, cfg.capital * wb));
+  if (!soloA || !soloB || !runA || !runB) return null;
+
+  // 날짜 합집합 위에 정렬 (교집합 시작 이후만)
+  const startMs = Math.max(runA.ts[runA.start], runB.ts[runB.start], s0);
+  const dates = [...new Set([
+    ...runA.ts.slice(runA.start), ...runB.ts.slice(runB.start)
+  ])].filter(t => t >= startMs).sort((x, y) => x - y);
+  const M = dates.length;
+  if (M < 60) return null;
+
+  const idxOf = (r) => { const m = new Map(); for (let i = 0; i < r.N; i++) m.set(r.ts[i], i); return m; };
+  const ixA = idxOf(runA), ixB = idxOf(runB);
+  const ixSA = idxOf(soloA), ixSB = idxOf(soloB);
+
+  /* ── 독립 배분 합산 ── */
+  const eqInd = new Float64Array(M);
+  { let la = cfg.capital * wa, lb = cfg.capital * wb;
+    for (let i = 0; i < M; i++) {
+      const ia = ixA.get(dates[i]); if (ia !== undefined && ia >= runA.start) la = runA.eq[ia];
+      const ib = ixB.get(dates[i]); if (ib !== undefined && ib >= runB.start) lb = runB.eq[ib];
+      eqInd[i] = la + lb;
+    } }
+
+  /* ── 공유 예수금 재생 ── */
+  // 단독(전액) 실행의 신호(매수 시도·매도 스케줄)를 그대로 쓰되,
+  // 실제 체결 수량은 공용 현금과 덩이 상한으로 다시 결정한다.
+  let eqSh = null, shStat = null;
+  if (cfg.shared) {
+    const pa = PARAMS[a] || defaultParams(a), pb = PARAMS[b] || defaultParams(b);
+    const totSplits = pa.splits + pb.splits;
+    const maxLots = Math.max(1, Math.round(totSplits * cfg.maxShare));
+    const chunk = { [a]: cfg.capital / totSplits, [b]: cfg.capital / totSplits };
+
+    // 신호 전용 실행: 슬롯 한도를 상한(maxLots)까지 열어 신호를 뽑는다.
+    // 단독 실행의 7덩이 제한에 묶이면 공유 풀의 여유 현금을 쓸 기회 자체가 생기지 않는다.
+    // 실제 체결 수량·현금·상한은 아래 재생 루프가 다시 결정한다.
+    const sigA = simulate(a, Object.assign(mk(a, cfg.capital), { splits: maxLots }));
+    const sigB = simulate(b, Object.assign(mk(b, cfg.capital), { splits: maxLots }));
+    if (!sigA || !sigB) return null;
+    const ixGA = idxOf(sigA), ixGB = idxOf(sigB);
+
+    // 시점별 우선순위: 독립(전액) 자산곡선의 롤링 수익/MDD
+    const rcA0 = rollingCalmar(soloA.eq.slice(soloA.start), cfg.rollWin);
+    const rcB0 = rollingCalmar(soloB.eq.slice(soloB.start), cfg.rollWin);
+    const rcA = new Map(), rcB = new Map();
+    for (let i = 0; i < rcA0.length; i++) rcA.set(soloA.ts[soloA.start + i], rcA0[i]);
+    for (let i = 0; i < rcB0.length; i++) rcB.set(soloB.ts[soloB.start + i], rcB0[i]);
+    // 미래참조 버전(참고용): 전 기간 고정
+    const fixedPri = soloA.summary.calmar >= soloB.summary.calmar ? a : b;
+
+    const state = {
+      [a]: { r: sigA, ix: ixGA, p: pa, lots: [], px: 0 },
+      [b]: { r: sigB, ix: ixGB, p: pb, lots: [], px: 0 }
+    };
+    let cash = cfg.capital;
+    eqSh = new Float64Array(M);
+    let buyBlockedCash = 0, buyBlockedCap = 0, priUsed = 0;
+    let investSum = 0;
+
+    const exact = 1;
+    for (let i = 0; i < M; i++) {
+      const t = dates[i];
+      // 1) 오늘 만기·목표 도달 매도
+      for (const id of [a, b]) {
+        const st = state[id], k = st.ix.get(t);
+        if (k !== undefined) st.px = st.r.px[k];
+        st.lots = st.lots.filter(l => {
+          if (t >= l.sellMs) {
+            cash += l.q * st.px * (1 - st.p.fee);
+            return false;
+          }
+          return true;
+        });
+      }
+      // 2) 매수 시도 수집 (단독 실행에서 그날 매수 신호가 있었는가)
+      const wants = [];
+      for (const id of [a, b]) {
+        const st = state[id], k = st.ix.get(t);
+        if (k === undefined || k < st.r.start) continue;
+        if (st.r._sig.qty[k] > 0) {
+          const si = st.r._sig.sellIdx[k];
+          wants.push({
+            id, k,
+            sellMs: si >= 0 ? st.r.ts[si] : Infinity,
+            ratio: st.r._sig.ratioArr[k]
+          });
+        }
+      }
+      // 3) 우선순위 정렬
+      if (wants.length === 2) {
+        priUsed++;
+        let first;
+        if (cfg.lookahead) first = fixedPri;
+        else {
+          const va = rcA.get(t), vb = rcB.get(t);
+          if (va !== null && va !== undefined && vb !== null && vb !== undefined) {
+            first = va >= vb ? a : b;
+          } else {
+            // 이력 부족: 목표 비중 대비 보유가 적은 쪽 우선
+            const holdA = state[a].lots.reduce((x, l) => x + l.q * state[a].px, 0);
+            const holdB = state[b].lots.reduce((x, l) => x + l.q * state[b].px, 0);
+            first = (holdA / Math.max(wa, .01)) <= (holdB / Math.max(wb, .01)) ? a : b;
+          }
+        }
+        wants.sort((x, y) => (x.id === first ? -1 : 1) - (y.id === first ? -1 : 1));
+      }
+      // 4) 체결
+      for (const w of wants) {
+        const st = state[w.id];
+        if (st.lots.length >= maxLots) { buyBlockedCap++; continue; }
+        const invest = Math.min(chunk[w.id] * w.ratio, cash);
+        const q = Math.floor(invest * (1 - st.p.fee) / st.px);
+        if (q <= 0) { buyBlockedCash++; continue; }
+        cash -= st.px * q * (1 + st.p.fee);
+        st.lots.push({ q, sellMs: w.sellMs });
+      }
+      // 5) 평가
+      let hold = 0;
+      for (const id of [a, b]) hold += state[id].lots.reduce((x, l) => x + l.q * state[id].px, 0);
+      investSum += hold;
+      eqSh[i] = cash + hold;
+    }
+    shStat = {
+      util: investSum / M / cfg.capital,
+      blockedCash: buyBlockedCash, blockedCap: buyBlockedCap, contested: priUsed
+    };
+  }
+
+  /* ── 지표 ── */
+  const days = (dates[M - 1] - dates[0]) / DAY;
+  const met = (eq) => {
+    const cagr = Math.pow(eq[M - 1] / cfg.capital, 365 / Math.max(days, 1)) - 1;
+    let pk = 0, mdd = 0;
+    for (let i = 0; i < M; i++) { if (eq[i] > pk) pk = eq[i]; const d = eq[i] / pk - 1; if (d < mdd) mdd = d; }
+    return { final: eq[M - 1], cagr, mdd, calmar: mdd ? -cagr / mdd : 0 };
+  };
+  // 단독을 같은 구간으로 절단해 재평가
+  const cut = (r) => {
+    const e = new Float64Array(M); let last = cfg.capital;
+    const ix = idxOf(r);
+    // 시작 자산을 구간 시작 시점 값으로 정규화
+    let base = null;
+    for (let i = 0; i < M; i++) {
+      const k = ix.get(dates[i]);
+      if (k !== undefined && k >= r.start) { if (base === null) base = r.eq[k]; last = r.eq[k]; }
+      e[i] = base ? last / base * cfg.capital : cfg.capital;
+    }
+    return e;
+  };
+  const eqA = cut(soloA), eqB = cut(soloB);
+  const ddA2 = ddOf(eqA, 0), ddB2 = ddOf(eqB, 0);
+  let both = 0;
+  for (let i = 0; i < M; i++) if (ddA2[i] < -0.15 && ddB2[i] < -0.15) both++;
+
+  const utilOf = (r, cap) => {
+    const ix = idxOf(r), inv = new Float64Array(M), tsi = new Map();
+    for (let i = 0; i < M; i++) tsi.set(dates[i], i);
+    for (const t of r.trades) {
+      const bi = tsi.get(t.buy), si = tsi.get(t.sell);
+      if (bi === undefined) continue;
+      for (let i = bi; i < (si === undefined ? M : si); i++) inv[i] += t.bp * t.q;
+    }
+    let s = 0; for (let i = 0; i < M; i++) s += inv[i];
+    return s / M / cap;
+  };
+
+  return {
+    dates, M, a, b, wa,
+    eqA, eqB, eqInd, eqSh,
+    solo: { [a]: met(eqA), [b]: met(eqB) },
+    ind: met(eqInd),
+    sh: eqSh ? met(eqSh) : null,
+    shStat,
+    ddCorr: corrOf(ddA2, ddB2),
+    bothDeep: both / M,
+    utilA: utilOf(soloA, cfg.capital), utilB: utilOf(soloB, cfg.capital),
+    from: iso(dates[0]), to: iso(dates[M - 1])
+  };
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1249,7 +1532,7 @@ function render() {
   if (!ok) { $('#dataPanel').style.display = ''; return; }
   store.set('cur', CUR);
   if (!PARAMS[CUR]) { PARAMS[CUR] = defaultParams(CUR); savePar(); }
-  buildParams(); run();
+  buildParams(); run(); fillPfB();
   OPT_BEST = null; $('#btnOptApply').disabled = true;
   $('#optTbl').innerHTML = '';
 }
@@ -1437,8 +1720,124 @@ $('#btnHardReload').addEventListener('click', () => {
 });
 $('#buildTag').textContent = APP_BUILD;
 
+
+/* ══════════════════════════════════════════════════════════
+   12. 조합 UI
+   ══════════════════════════════════════════════════════════ */
+function pfCfg() {
+  return {
+    a: CUR, b: $('#pfB').value,
+    wa: (+$('#pfWa').value || 50) / 100,
+    capital: (PARAMS[CUR] || defaultParams(CUR)).capital,
+    years: (PARAMS[CUR] || defaultParams(CUR)).years,
+    shared: +$('#pfShared').value,
+    rollWin: +$('#pfRoll').value,
+    maxShare: +$('#pfMax').value,
+    lookahead: +$('#pfLook').value
+  };
+}
+function fillPfB() {
+  const sel = $('#pfB');
+  const opts = tradables().filter(r => r.id !== CUR)
+    .map(r => `<option value="${r.id}"${sel.value === r.id ? ' selected' : ''}>${r.id}</option>`).join('');
+  sel.innerHTML = opts || '<option value="">종목을 추가하세요</option>';
+}
+function pfRow(name, m, extra, best) {
+  return `<tr${best ? ' class="bestrow"' : ''}><td>${name}</td>
+    <td class="num">${usd(m.final)}</td>
+    <td class="num ${cls(m.cagr)}">${pct(m.cagr, 1)}</td>
+    <td class="num neg">${pct(m.mdd, 1)}</td>
+    <td class="num"><b>${m.calmar.toFixed(2)}</b></td>
+    <td class="num" style="color:var(--muted)">${extra || ''}</td></tr>`;
+}
+function runPf() {
+  const cfg = pfCfg();
+  if (!cfg.b) { $('#pfTbl').innerHTML = '<tbody><tr><td style="color:var(--muted)">상대 종목이 없습니다. 먼저 종목을 추가하세요.</td></tr></tbody>'; return; }
+  const R = simulatePortfolio(cfg);
+  if (!R) { $('#pfTbl').innerHTML = '<tbody><tr><td style="color:var(--muted)">공통 구간이 부족합니다.</td></tr></tbody>'; return; }
+
+  const rows = [
+    [`${R.a} 단독`, R.solo[R.a], `가동률 ${pct(R.utilA, 0)}`],
+    [`${R.b} 단독`, R.solo[R.b], `가동률 ${pct(R.utilB, 0)}`],
+    [`조합 ${Math.round(R.wa * 100)}/${Math.round((1 - R.wa) * 100)} · 독립`, R.ind, '']
+  ];
+  if (R.sh) rows.push([
+    `조합 · 공유 예수금${cfg.lookahead ? ' (미래참조)' : ''}`, R.sh,
+    `가동률 ${pct(R.shStat.util, 0)} · 경합 ${R.shStat.contested}일`
+  ]);
+  const bestI = rows.reduce((bi, r, i) => r[1].calmar > rows[bi][1].calmar ? i : bi, 0);
+  $('#pfTbl').innerHTML = `<thead><tr><th>구성</th><th>최종자산</th><th>CAGR</th><th>MDD</th><th>수익/MDD</th><th>비고</th></tr></thead>
+    <tbody>${rows.map((r, i) => pfRow(r[0], r[1], r[2], i === bestI)).join('')}</tbody>`;
+
+  $('#pfCap').textContent = `${R.from} ~ ${R.to} (교집합) · 낙폭 상관 ${R.ddCorr.toFixed(2)}`
+    + ` · 동시 −15% 이하 ${pct(R.bothDeep, 1)}`
+    + (R.sh ? ` · 현금부족으로 못 산 매수 ${R.shStat.blockedCash}회 · 상한 차단 ${R.shStat.blockedCap}회` : '');
+
+  drawPf(R);
+}
+function drawPf(R) {
+  const box = $('#pfChart');
+  const w = Math.max(300, box.clientWidth || 600), h = 150;
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  box.innerHTML = '<canvas></canvas>';
+  const cv = box.querySelector('canvas');
+  cv.width = w * dpr; cv.height = h * dpr; cv.style.width = '100%'; cv.style.height = h + 'px';
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const M = R.M, x0 = 2, x1 = w - 46;
+  const X = i => x0 + (x1 - x0) * i / (M - 1);
+  const all = [R.eqA, R.eqB, R.eqInd, R.eqSh].filter(Boolean);
+  let lo = Infinity, hi = -Infinity;
+  for (const e of all) for (let i = 0; i < M; i++) { lo = Math.min(lo, e[i]); hi = Math.max(hi, e[i]); }
+  const L = Math.log(Math.max(lo * .95, 1)), Hn = Math.log(hi * 1.03);
+  const Y = v => 6 + (h - 14) * (1 - (Math.log(v) - L) / (Hn - L));
+  const draws = [
+    [R.eqA, '#C9CDC2', 1.1], [R.eqB, '#A9AFA0', 1.1],
+    [R.eqInd, '#2A6AAE', 1.6], [R.eqSh, '#15181C', 1.8]
+  ];
+  for (const [e, c, wd] of draws) {
+    if (!e) continue;
+    g.strokeStyle = c; g.lineWidth = wd; g.lineJoin = 'round'; g.beginPath();
+    for (let i = 0; i < M; i++) { const x = X(i), y = Y(e[i]); i ? g.lineTo(x, y) : g.moveTo(x, y); }
+    g.stroke();
+  }
+  g.font = '10px "IBM Plex Mono",monospace'; g.fillStyle = '#8B9083'; g.textAlign = 'left';
+  const labels = [[R.eqA, R.a], [R.eqB, R.b], [R.eqInd, '독립'], [R.eqSh, '공유']];
+  let yUsed = [];
+  for (const [e, t] of labels) {
+    if (!e) continue;
+    let y = Y(e[M - 1]);
+    while (yUsed.some(u => Math.abs(u - y) < 11)) y += 11;
+    yUsed.push(y);
+    g.fillText(t, x1 + 4, y + 3);
+  }
+}
+function runPfSweep() {
+  const cfg = pfCfg();
+  if (!cfg.b) return;
+  const goal = [];
+  for (let w = 10; w <= 90; w += 10) {
+    const R = simulatePortfolio(Object.assign({}, cfg, { wa: w / 100 }));
+    if (R) goal.push({ w, ind: R.ind, sh: R.sh });
+  }
+  if (!goal.length) return;
+  const bi = goal.reduce((b, r, i) => (r.sh || r.ind).calmar > (goal[b].sh || goal[b].ind).calmar ? i : b, 0);
+  $('#pfTbl').innerHTML = `<thead><tr><th>${CUR} 비중</th><th colspan="3">독립 (자산 / CAGR / MDD)</th><th>수익/MDD</th>
+    ${cfg.shared ? '<th colspan="3">공유 (자산 / CAGR / MDD)</th><th>수익/MDD</th>' : ''}</tr></thead><tbody>`
+    + goal.map((r, i) => `<tr${i === bi ? ' class="bestrow"' : ''}>
+      <td class="num">${r.w}%</td>
+      <td class="num">${usd(r.ind.final)}</td><td class="num">${pct(r.ind.cagr, 1)}</td><td class="num neg">${pct(r.ind.mdd, 1)}</td>
+      <td class="num"><b>${r.ind.calmar.toFixed(2)}</b></td>
+      ${cfg.shared && r.sh ? `<td class="num">${usd(r.sh.final)}</td><td class="num">${pct(r.sh.cagr, 1)}</td><td class="num neg">${pct(r.sh.mdd, 1)}</td>
+      <td class="num"><b>${r.sh.calmar.toFixed(2)}</b></td>` : ''}</tr>`).join('') + '</tbody>';
+  $('#pfCap').textContent = '음영 행 = 수익/MDD 최고. 표의 값은 과최적화 가능성이 있으니 참고용으로만 쓰세요.';
+  $('#pfChart').innerHTML = '';
+}
+$('#btnPf').addEventListener('click', runPf);
+$('#btnPfSweep').addEventListener('click', runPfSweep);
+
 render();
 renderSec();
+fillPfB();
 if (isLocked()) { showLock(true); setTimeout(() => $('#lockPin').focus(), 60); }
 log('내장 스냅샷(SOXL·TQQQ·QQQ)으로 시작했습니다. 티커를 입력해 종목을 추가하세요.');
 
